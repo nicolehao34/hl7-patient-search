@@ -1,0 +1,13 @@
+services:
+  hl7-search:
+    build: .
+    ports:
+      - "2575:2575"
+      - "8000:8000"
+    volumes:
+      - hl7-data:/data
+    restart: unless-stopped
+
+volumes:
+  hl7-data:
+

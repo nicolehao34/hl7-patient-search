@@ -1,0 +1,31 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "hl7-patient-search"
+version = "0.1.0"
+description = "Receive HL7 v2 over MLLP and search normalized patient data"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+  "fastapi>=0.115,<1",
+  "uvicorn>=0.34,<1",
+]
+
+[project.optional-dependencies]
+dev = ["httpx>=0.28,<1", "pytest>=8.3,<10", "ruff>=0.11,<1"]
+
+[project.scripts]
+hl7-search = "hl7search.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/hl7search"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
