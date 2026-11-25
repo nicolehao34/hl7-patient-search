@@ -9,6 +9,39 @@ from pathlib import Path
 from typing import Any
 
 from .models import ParsedMessage
+from .parser import HL7ParseError, parse_message, utc_message_time
+
+
+def message_predicates(filters: dict[str, Any]) -> tuple[list[str], list[Any]]:
+    clauses: list[str] = []
+    values: list[Any] = []
+    for key in ("sending_application", "sending_facility", "message_type", "trigger_event", "control_id"):
+        if filters.get(key) is not None:
+            clauses.append(f"m.{key} = ?")
+            values.append(filters[key])
+    since, before = (
+        utc_message_time(filters[key]) if filters.get(key) is not None else None
+        for key in ("message_since", "message_before")
+    )
+    if since is not None and before is not None and since >= before:
+        raise ValueError("message_since must be earlier than message_before")
+    if since is not None:
+        clauses.append("m.message_at >= ?")
+        values.append(since.isoformat())
+    if before is not None:
+        clauses.append("m.message_at < ?")
+        values.append(before.isoformat())
+    provider = ["op.message_id = m.id"]
+    for key, clause in (
+        ("ordering_provider_id", "op.identifier = ?"),
+        ("ordering_provider_name", "op.name = ? COLLATE NOCASE"),
+    ):
+        if filters.get(key) is not None:
+            provider.append(clause)
+            values.append(filters[key])
+    if len(provider) > 1:
+        clauses.append(f"EXISTS (SELECT 1 FROM ordering_providers op WHERE {' AND '.join(provider)})")
+    return clauses, values
 
 
 class DuplicateMessageError(ValueError):
@@ -67,7 +100,38 @@ class Store:
                 CREATE INDEX IF NOT EXISTS idx_encounters_admit ON encounters(facility, admit_at);
                 CREATE INDEX IF NOT EXISTS idx_observations_code ON observations(code, value);
                 CREATE INDEX IF NOT EXISTS idx_orders_code ON orders(code);
+                CREATE TABLE IF NOT EXISTS ordering_providers (
+                    message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+                    identifier TEXT, name TEXT);
+                CREATE INDEX IF NOT EXISTS idx_provider_message ON ordering_providers(message_id);
+                CREATE INDEX IF NOT EXISTS idx_provider_identifier ON ordering_providers(identifier, message_id);
+                CREATE INDEX IF NOT EXISTS idx_provider_name ON ordering_providers(name COLLATE NOCASE, message_id);
+                CREATE INDEX IF NOT EXISTS idx_message_source_time ON messages(sending_application, sending_facility, message_at);
+                CREATE INDEX IF NOT EXISTS idx_message_facility_time ON messages(sending_facility, message_at);
+                CREATE INDEX IF NOT EXISTS idx_message_time ON messages(message_at);
+                CREATE INDEX IF NOT EXISTS idx_message_patient ON messages(patient_id, id);
+                CREATE INDEX IF NOT EXISTS idx_observations_message_code ON observations(message_id, code);
+                CREATE INDEX IF NOT EXISTS idx_orders_message_code ON orders(message_id, code);
             """)
+            conn.execute("BEGIN IMMEDIATE")
+            if conn.execute("PRAGMA user_version").fetchone()[0] == 0:
+                for row in conn.execute("SELECT id, raw, message_at FROM messages"):
+                    try:
+                        message = parse_message(row["raw"])
+                    except HL7ParseError:
+                        continue
+                    timestamp = message.message_at.isoformat()
+                    if timestamp != row["message_at"]:
+                        conn.execute("UPDATE messages SET message_at=? WHERE id=?", (timestamp, row["id"]))
+                    self._insert_providers(conn, row["id"], message)
+                conn.execute("PRAGMA user_version=1")
+
+    @staticmethod
+    def _insert_providers(conn: sqlite3.Connection, message_id: int, message: ParsedMessage) -> None:
+        conn.executemany(
+            "INSERT INTO ordering_providers (message_id, identifier, name) VALUES (?, ?, ?)",
+            ((message_id, provider.identifier, provider.name) for provider in message.ordering_providers),
+        )
 
     def ingest(self, message: ParsedMessage) -> int:
         now = datetime.now(UTC).isoformat()
@@ -99,6 +163,7 @@ class Store:
             except sqlite3.IntegrityError as exc:
                 raise DuplicateMessageError(message.control_id) from exc
             message_id = int(cursor.lastrowid)
+            self._insert_providers(conn, message_id, message)
             if patient_id and message.encounter:
                 e = message.encounter
                 status = "discharged" if message.trigger_event == "A03" or e.discharge_at else "active"
@@ -145,30 +210,68 @@ class Store:
             clauses.append("e.admit_at >= ?"); values.append(filters["admitted_since"])
         if filters.get("admitted_before"):
             clauses.append("e.admit_at < ?"); values.append(filters["admitted_before"])
-        if filters.get("observation_code"):
-            clauses.append("EXISTS (SELECT 1 FROM observations o WHERE o.patient_id=p.id AND o.code=?)")
-            values.append(filters["observation_code"])
+        source_clauses, source_values = message_predicates(filters)
+        scope = "message_id=m.id" if source_clauses else "patient_id=p.id"
+        clinical_clauses: list[str] = []
+        clinical_values: list[Any] = []
+        code = filters.get("observation_code")
+        bounds = filters.get("observation_min"), filters.get("observation_max")
+        if any(value is not None for value in bounds) and not code:
+            raise ValueError("observation_min/max require observation_code")
+        if code:
+            observation = [scope, "code=?"]
+            clinical_values.append(code)
+            for op, value in zip((">=", "<="), bounds, strict=True):
+                if value is not None:
+                    observation.append(f"CAST(value AS REAL) {op} ?")
+                    clinical_values.append(value)
+            clinical_clauses.append(
+                f"EXISTS (SELECT 1 FROM observations WHERE {' AND '.join(observation)})"
+            )
         if filters.get("order_code"):
-            clauses.append("EXISTS (SELECT 1 FROM orders x WHERE x.patient_id=p.id AND x.code=?)")
-            values.append(filters["order_code"])
-        numeric = filters.get("observation_min"), filters.get("observation_max")
-        if any(value is not None for value in numeric):
-            code = filters.get("observation_code")
-            if not code:
-                raise ValueError("observation_min/max require observation_code")
-            bound = []
-            if numeric[0] is not None: bound.append("CAST(o.value AS REAL) >= ?"); values.append(numeric[0])
-            if numeric[1] is not None: bound.append("CAST(o.value AS REAL) <= ?"); values.append(numeric[1])
-            clauses.append("EXISTS (SELECT 1 FROM observations o WHERE o.patient_id=p.id AND o.code=? AND " + " AND ".join(bound) + ")")
-            # The extra EXISTS code parameter must precede its bounds.
-            values.insert(len(values) - len(bound), code)
+            clinical_clauses.append(f"EXISTS (SELECT 1 FROM orders WHERE {scope} AND code=?)")
+            clinical_values.append(filters["order_code"])
+        if source_clauses:
+            match = " AND ".join(["m.patient_id=p.id", *source_clauses, *clinical_clauses])
+            clauses.append(f"EXISTS (SELECT 1 FROM messages m WHERE {match})")
+        else:
+            clauses.extend(clinical_clauses)
+        values.extend(source_values)
+        values.extend(clinical_values)
         limit = min(max(int(filters.get("limit", 50)), 1), 500)
+        join = "LEFT JOIN" if source_clauses else "JOIN"
         sql = f"""SELECT DISTINCT p.*, e.visit_number, e.facility, e.patient_class, e.location,
             e.admit_at, e.discharge_at, e.status FROM patients p
-            JOIN encounters e ON e.patient_id=p.id WHERE {' AND '.join(clauses)}
+            {join} encounters e ON e.patient_id=p.id WHERE {' AND '.join(clauses)}
             ORDER BY e.admit_at DESC LIMIT ?"""
         with self.connect() as conn:
             return [dict(row) for row in conn.execute(sql, (*values, limit))]
+
+    def search_messages(self, **filters: Any) -> list[dict[str, Any]]:
+        clauses, values = message_predicates(filters)
+        for key, column in (("patient_id", "m.patient_id = ?"), ("before_id", "m.id < ?")):
+            if filters.get(key) is not None:
+                clauses.append(column)
+                values.append(filters[key])
+        where = " AND ".join(clauses) or "1=1"
+        with self.connect() as conn:
+            rows = conn.execute(f"""
+                SELECT m.id, m.patient_id, m.sending_application, m.sending_facility, m.control_id,
+                       m.message_type, m.trigger_event, m.version, m.message_at, m.received_at
+                FROM messages m WHERE {where} ORDER BY m.id DESC LIMIT ?
+                """, (*values, filters.get("limit", 50)))
+            return [dict(row) for row in rows]
+
+    def message_detail(self, message_id: int) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            row = conn.execute("SELECT * FROM messages WHERE id=?", (message_id,)).fetchone()
+            if row is None:
+                return None
+            providers = conn.execute(
+                "SELECT identifier, name FROM ordering_providers WHERE message_id=? ORDER BY rowid",
+                (message_id,),
+            )
+            return {**dict(row), "ordering_providers": [dict(provider) for provider in providers]}
 
     def patient_detail(self, patient_id: int) -> dict[str, Any] | None:
         with self.connect() as conn:

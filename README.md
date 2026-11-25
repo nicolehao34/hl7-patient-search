@@ -16,33 +16,31 @@ Requires Python 3.12+ and [uv](https://docs.astral.sh/uv/).
 
 ```bash
 uv sync --extra dev
-uv run hl7-search serve
+uv run hl7-search serve --mllp-host 127.0.0.1
 ```
 
-The MLLP receiver listens on `0.0.0.0:2575`; the HTTP API and interactive docs are available at
-`http://127.0.0.1:8000` and `http://127.0.0.1:8000/docs`. In another terminal, load the examples:
+The command binds MLLP to `127.0.0.1:2575` for local testing. In a second terminal, send ten synthetic
+HL7 v2.5.1 messages over MLLP:
 
 ```bash
-for message in examples/*.hl7; do uv run hl7-search send "$message"; done
+uv run python examples/seed_demo.py
 ```
 
-Each send prints an HL7 ACK containing `MSA|AA`. Then try searches:
+The seed sends six ADT events, three ORU lab results, and one ORM order across two hospitals. It
+prints an `MSA|AA` acknowledgment for each message. Dates are relative to the first seed run.
+Stable control IDs make reruns safe against the same database. To regenerate dates, seed a fresh
+database by starting the server with a new `--database` path.
 
-```bash
-# Active inpatients admitted at GENERAL since midnight on Nov 25
-curl 'http://127.0.0.1:8000/patients?facility=GENERAL&patient_class=I&status=active&admitted_since=2026-11-25T00:00:00'
+Open the [search page](http://127.0.0.1:8000/) or try the endpoints in [Swagger UI](http://127.0.0.1:8000/docs).
 
-# Patients whose LOINC 2160-0 (creatinine) is at least 1.5
-curl 'http://127.0.0.1:8000/patients?observation_code=2160-0&observation_min=1.5'
+- **Patients** starts with a seven-day admission filter and shows the most recent admissions first.
+  With fresh seed data, set **Hospital** to `GENERAL` to see Avery, Blake, and Devon. Click **View
+  patient** to see the encounters, observations, and orders behind a row.
+- **HL7 messages** searches the stored feed. Choose `ORU` and set **Ordering provider ID** to
+  `PROVIDER123` to see three lab messages. Click **View HL7** to inspect the stored payload.
 
-# Patients with a CT chest order
-curl 'http://127.0.0.1:8000/patients?order_code=IMG200'
-```
-
-These return Alice, Alice, and Carol respectively. Bob is excluded from the first query because he
-was admitted at `COMMUNITY`; Carol is excluded because `PV1-2` marks her outpatient (`O`).
-
-Alternatively, `docker compose up --build` starts the same service with a persistent volume.
+Use `uv run hl7-search send examples/oru_r01_alice.hl7` to send an individual checked-in fixture.
+`docker compose up --build` starts the same service with a persistent volume.
 
 ## Hospital/interface-engine configuration
 
@@ -81,9 +79,9 @@ and projects selected fields into queryable tables:
 | `ADT^A02`, `A06`, `A07` | transfer or class change | Updates the same facility/visit, so searches use the latest location/class. |
 | `ADT^A03` | discharge | Marks the visit discharged and records `PV1-45`; it no longer matches `status=active`. |
 | `ADT^A08` | demographic/visit update | Applies non-empty fields without erasing previously known values. |
-| `ORU^R01` | unsolicited result | Stores each `OBX` code, value, units, status and observation time; enables code and numeric-threshold cohorts. |
-| `ORM^O01` | general order | Stores `ORC`/`OBR` order identifiers and universal service code; enables ordered-procedure cohorts. |
-| Other types | site-specific or unsupported | The raw message and envelope remain durable; recognized `PID`, `PV1`, `OBR`, and `OBX` segments are still projected conservatively. |
+| `ORU^R01` | unsolicited result | Stores individual `OBX` results and indexes `OBR-16` ordering providers. |
+| `ORM^O01` | general order | Stores `OBR` order identifiers and test or procedure codes. Indexes `OBR-16` ordering providers. |
+| Other types | site-specific or unsupported | Stores the message and header metadata. Projection depends on the recognized segments and message type. |
 
 Patient identity is the pair `PID-3.1` + `PID-3.4` (ID and assigning authority), not name or date of
 birth. Encounters are keyed by sending facility + `PV1-19`. Real health systems require cross-domain
@@ -95,22 +93,138 @@ identifiers, common escape sequences, CR or LF segment endings, and decreasing-p
 timestamps. It retains observation values as strings because `OBX-2` permits many data types; numeric
 threshold search casts values only when explicitly requested.
 
+## Search design
+
+MLLP and HTTP ingestion share the parser and SQLite store. A single transaction saves the HL7
+payload and its header, patient, encounter, clinical, and provider records. This keeps the source
+message available for inspection and makes its indexed fields searchable as soon as the transaction
+commits.
+
+**Patient discovery** starts with patients and encounters. Admission filters use `PV1-44`, and the
+results are ordered by admission time, newest first. A patient with multiple matching encounters can
+appear more than once. Observation and order filters alone search the patient's history. Adding a
+message filter requires the header, provider, and clinical criteria to match the same source
+message. Encounter criteria still apply independently to the patient's visits. A message-scoped
+search can also return patients without an encounter when no encounter filter is set.
+
+**Message history** starts with messages and returns metadata in descending message ID order
+(newest ingested first). It can include messages without a linked patient. Filter by the sender's
+`MSH-7` timestamp, then use the internal message ID to retrieve the stored HL7 text when needed.
+Indexing the headers and providers lets history searches run without reparsing patient payloads.
+
 ## API
 
-- `POST /messages` accepts raw HL7 as an HTTP convenience path (MLLP remains the hospital feed).
-- `GET /patients` filters by `facility`, `admitted_since`, `admitted_before`, `status`,
-  `patient_class`, `mrn`, `observation_code`, `observation_min`, `observation_max`, and `order_code`.
-- `GET /patients/{id}` returns the patient with encounters, observations, and orders.
-- `GET /health` reports readiness and row counts.
+| Endpoint | Behavior |
+|---|---|
+| `GET /` | Serves the browser search page. |
+| `POST /messages` | Accepts raw HL7 text. Returns `202` after storage, `202` with `duplicate: true` on retry, or `422` for invalid HL7. |
+| `GET /patients` | Searches patient and encounter records by `facility`, `admitted_since`, `admitted_before`, `status`, `patient_class`, `mrn`, `observation_code`, `observation_min`, `observation_max`, and `order_code`, plus the message filters below. Numeric bounds require an observation code. |
+| `GET /patients/{id}` | Returns demographics, encounters, observations, and orders for an internal patient ID. Returns `404` if the record is missing. |
+| `GET /messages` | Lists metadata. Filter by internal `patient_id` for patient history. Pass the last item's `id` as `before_id` to fetch the next page with the same filters. |
+| `GET /messages/{id}` | Returns metadata, ordering providers, and the stored HL7 payload in `raw`. Returns `404` if the record is missing. |
+| `GET /health` | Reports service status and SQLite row counts. |
 
-Search uses normalized SQL fields so filter criteria map directly to patient, encounter, observation,
-and order data.
+Both search endpoints default to `limit=50`, with a maximum of 500. Admission and message time
+windows use inclusive starts and exclusive ends. Admission bounds compare to the stored visit
+time. Use an ISO 8601 date-time without an offset when filtering the demo's admission times.
+
+Both search endpoints accept these filters:
+
+| Query parameters | HL7 field and matching rule |
+|---|---|
+| `sending_application`, `sending_facility` | Exact match against the stored `MSH-3` and `MSH-4` fields. |
+| `message_since`, `message_before` | Inclusive start and exclusive end on `MSH-7`. Use ISO 8601 query values. Offsets are converted to UTC and omitted offsets are treated as UTC for the demo. The response's `message_at` uses UTC with no suffix. |
+| `ordering_provider_id`, `ordering_provider_name` | Search every `OBR-16` repetition, including on ORU results. Match `XCN.1` exactly or the extracted `Given Surname` using SQLite's ASCII case-insensitive comparison. When both filters are set, they must match the same provider repetition. |
+| `message_type`, `trigger_event`, `control_id` | Exact match on `MSH-9.1`, `MSH-9.2`, and `MSH-10`. |
+
+```bash
+# Two lab messages from GENERAL in a freshly seeded database
+curl 'http://127.0.0.1:8000/messages?message_type=ORU&sending_application=DEMO_LIS&sending_facility=GENERAL'
+
+# Avery and Casey have creatinine of at least 1.5 mg/dL in the seeded feed
+curl 'http://127.0.0.1:8000/patients?ordering_provider_id=PROVIDER123&observation_code=2160-0&observation_min=1.5'
+```
+
+To restrict message history to an interval, add `message_since=2026-11-25T00:00:00Z` and
+`message_before=2026-11-26T00:00:00Z` (or use dates from your seed run). These filter the sender's
+message time. Use `admitted_since` and `admitted_before` for a patient's admission time.
+
+On first startup with an older SQLite database, the service backfills ordering providers and
+normalized message times from retained HL7 in a write transaction. Allow extra startup time for
+large databases. Legacy records that fail the current parser retain their existing metadata.
+
+## The ten seeded HL7 messages
+
+<details>
+<summary>Show the ten payloads from the November 25, 2026 demo run</summary>
+
+These synthetic messages are shown in ingestion order. Line breaks represent HL7 carriage-return
+segment terminators. Blank lines separate messages for readability. The MLLP sender frames each
+message individually.
+
+```text
+MSH|^~\&|DEMO_EHR|GENERAL|||20261125194618+0000||ADT^A01|UI-DEMO-ADT-A01-01|P|2.5.1
+EVN|A01|20261125194618+0000
+PID|1||UI-DEMO-01^^^GENERAL^MR||Demo^Avery||19800101
+PV1|1|I|WARD^101^A||||||||||||||||UI-DEMO-V01|||||||||||||||||||||||||20261125194618+0000
+
+MSH|^~\&|DEMO_EHR|GENERAL|||20261124194618+0000||ADT^A01|UI-DEMO-ADT-A01-02|P|2.5.1
+EVN|A01|20261124194618+0000
+PID|1||UI-DEMO-02^^^GENERAL^MR||Demo^Blake||19800101
+PV1|1|I|WARD^101^A||||||||||||||||UI-DEMO-V02|||||||||||||||||||||||||20261124194618+0000
+
+MSH|^~\&|DEMO_EHR|COMMUNITY|||20261123194618+0000||ADT^A01|UI-DEMO-ADT-A01-03|P|2.5.1
+EVN|A01|20261123194618+0000
+PID|1||UI-DEMO-03^^^COMMUNITY^MR||Demo^Casey||19800101
+PV1|1|I|WARD^101^A||||||||||||||||UI-DEMO-V03|||||||||||||||||||||||||20261123194618+0000
+
+MSH|^~\&|DEMO_EHR|GENERAL|||20261122194618+0000||ADT^A04|UI-DEMO-ADT-A04-04|P|2.5.1
+EVN|A04|20261122194618+0000
+PID|1||UI-DEMO-04^^^GENERAL^MR||Demo^Devon||19800101
+PV1|1|O|WARD^101^A||||||||||||||||UI-DEMO-V04|||||||||||||||||||||||||20261122194618+0000
+
+MSH|^~\&|DEMO_EHR|COMMUNITY|||20261111194618+0000||ADT^A01|UI-DEMO-ADT-A01-05|P|2.5.1
+EVN|A01|20261111194618+0000
+PID|1||UI-DEMO-05^^^COMMUNITY^MR||Demo^Ellis||19800101
+PV1|1|I|WARD^101^A||||||||||||||||UI-DEMO-V05|||||||||||||||||||||||||20261111194618+0000
+
+MSH|^~\&|DEMO_LIS|GENERAL|||20261125204618+0000||ORU^R01|UI-DEMO-ORU-R01-01|P|2.5.1
+PID|1||UI-DEMO-01^^^GENERAL^MR||Demo^Avery||19800101
+PV1|1|I|WARD^101^A||||||||||||||||UI-DEMO-V01|||||||||||||||||||||||||20261125194618+0000
+OBR|1||DEMO-LAB-1|2160-0^Creatinine^LN|||20261125204618+0000|||||||||PROVIDER123^Chen^Maya
+OBX|1|NM|2160-0^Creatinine^LN||1.8|mg/dL|||||F|||20261125204618+0000
+
+MSH|^~\&|DEMO_LIS|GENERAL|||20261124204618+0000||ORU^R01|UI-DEMO-ORU-R01-02|P|2.5.1
+PID|1||UI-DEMO-02^^^GENERAL^MR||Demo^Blake||19800101
+PV1|1|I|WARD^101^A||||||||||||||||UI-DEMO-V02|||||||||||||||||||||||||20261124194618+0000
+OBR|1||DEMO-LAB-2|2160-0^Creatinine^LN|||20261124204618+0000|||||||||PROVIDER123^Chen^Maya
+OBX|1|NM|2160-0^Creatinine^LN||0.9|mg/dL|||||F|||20261124204618+0000
+
+MSH|^~\&|DEMO_LIS|COMMUNITY|||20261123204618+0000||ORU^R01|UI-DEMO-ORU-R01-03|P|2.5.1
+PID|1||UI-DEMO-03^^^COMMUNITY^MR||Demo^Casey||19800101
+PV1|1|I|WARD^101^A||||||||||||||||UI-DEMO-V03|||||||||||||||||||||||||20261123194618+0000
+OBR|1||DEMO-LAB-3|2160-0^Creatinine^LN|||20261123204618+0000|||||||||PROVIDER123^Chen^Maya
+OBX|1|NM|2160-0^Creatinine^LN||2.1|mg/dL|||||F|||20261123204618+0000
+
+MSH|^~\&|DEMO_RIS|GENERAL|||20261123214618+0000||ORM^O01|UI-DEMO-ORM-O01-04|P|2.5.1
+PID|1||UI-DEMO-04^^^GENERAL^MR||Demo^Devon||19800101
+PV1|1|O|WARD^101^A||||||||||||||||UI-DEMO-V04|||||||||||||||||||||||||20261122194618+0000
+ORC|NW|DEMO-CT-1
+OBR|1|DEMO-CT-1||IMG200^CT chest without contrast||||||||||||PROVIDER456^Patel^Anika
+
+MSH|^~\&|DEMO_EHR|COMMUNITY|||20261124214618+0000||ADT^A03|UI-DEMO-ADT-A03-03|P|2.5.1
+EVN|A03|20261124214618+0000
+PID|1||UI-DEMO-03^^^COMMUNITY^MR||Demo^Casey||19800101
+PV1|1|I|WARD^101^A||||||||||||||||UI-DEMO-V03|||||||||||||||||||||||||20261123194618+0000|20261124214618+0000
+```
+
+</details>
 
 ## Next steps for high-volume ingestion
 
 ### Workload and retention
 
-The five demo fixtures are 221–347 bytes each. They contain just enough fields for the walkthrough.
+The five demo fixtures are 221–377 bytes each. They contain just enough fields for the walkthrough.
 An InterSystems benchmark reported an average of 1.2 KB for its ADT and ORU workload. A clinical data
 warehouse study reported 411 MB across 343,091 HL7 v2 messages, also about 1.2 KB per message.
 These are examples from specific feeds. Measure payload bytes by sender and message type and track
@@ -136,8 +250,8 @@ SQLite WAL mode lets readers run during a write, with one writer at a time. [SQL
 
 Preload a representative retained dataset, then drive the average rate and bursts through MLLP
 while running admission and observation searches. Record p95 and p99 ACK latency, receipt-to-search
-lag, query latency, write contention, and database and WAL growth. Include a lookup by patient and
-date once historical-message access is available. Use the results to determine whether indexing,
+lag, query latency, write contention, and database and WAL growth. Include a historical-message
+lookup by patient and date. Use the results to determine whether indexing,
 shorter write transactions, or checkpoint tuning can keep SQLite within the target. The workload
 and latency figures above are planning targets that still need a load test.
 

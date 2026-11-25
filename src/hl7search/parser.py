@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from datetime import datetime
+import re
+from datetime import UTC, datetime
 
-from .models import Encounter, Observation, Order, ParsedMessage, Patient
+from .models import Encounter, Observation, Order, OrderingProvider, ParsedMessage, Patient
 
 
 class HL7ParseError(ValueError):
@@ -20,6 +21,31 @@ def parse_timestamp(value: str) -> datetime | None:
         except ValueError:
             continue
     raise HL7ParseError(f"invalid HL7 timestamp: {value!r}")
+
+
+def utc_message_time(value: datetime) -> datetime:
+    """Use a common UTC timeline for offset-bearing and offset-free messages."""
+    if value.tzinfo is None:
+        return value
+    return value.astimezone(UTC).replace(tzinfo=None)
+
+
+def parse_message_timestamp(value: str) -> datetime:
+    if not value:
+        raise HL7ParseError("MSH-7 message timestamp is required")
+    match = re.fullmatch(r"([0-9]{4}(?:[0-9]{2}){0,5})(\.[0-9]{1,4})?([+-][0-9]{4})?", value)
+    if match is None:
+        raise HL7ParseError("invalid MSH-7 timestamp")
+    digits, fraction, offset = match.groups()
+    formats = {4: "%Y", 6: "%Y%m", 8: "%Y%m%d", 10: "%Y%m%d%H",
+               12: "%Y%m%d%H%M", 14: "%Y%m%d%H%M%S"}
+    if fraction and len(digits) != 14:
+        raise HL7ParseError("invalid MSH-7 timestamp precision")
+    fmt = formats[len(digits)] + (".%f" if fraction else "") + ("%z" if offset else "")
+    try:
+        return utc_message_time(datetime.strptime(value, fmt))
+    except (ValueError, OverflowError) as exc:
+        raise HL7ParseError("invalid MSH-7 timestamp") from exc
 
 
 def _component(value: str, index: int, component_sep: str = "^") -> str | None:
@@ -55,7 +81,9 @@ def parse_message(raw: str | bytes) -> ParsedMessage:
         raise HL7ParseError("MSH is missing required fields")
     encoding = msh[1]
     component_sep = encoding[0] if encoding else "^"
+    repetition_sep = encoding[1] if len(encoding) > 1 else "~"
     escape = encoding[2] if len(encoding) > 2 else "\\"
+    subcomponent_sep = encoding[3] if len(encoding) > 3 else "&"
     segments: dict[str, list[list[str]]] = {}
     for line in lines:
         fields = line.split(field_sep)
@@ -133,14 +161,26 @@ def parse_message(raw: str | bytes) -> ParsedMessage:
                 ordered_at=parse_timestamp(obr[7]) if len(obr) > 7 and obr[7] else None,
             ))
 
-    message_at = parse_timestamp(field("MSH", 7))
-    if message_at is None:
-        raise HL7ParseError("MSH-7 message timestamp is required")
+    providers: list[OrderingProvider] = []
+    for obr in segments.get("OBR", []):
+        if len(obr) <= 16:
+            continue
+        for xcn in obr[16].split(repetition_sep):
+            identifier = _unescape(_component(xcn, 0, component_sep), escape)
+            family = _component(xcn, 1, component_sep) or ""
+            given = _component(xcn, 2, component_sep)
+            surname = _unescape(family.split(subcomponent_sep)[0], escape)
+            name = " ".join(part for part in (_unescape(given, escape), surname) if part)
+            if identifier or name:
+                providers.append(OrderingProvider(identifier, name or None))
+
+    message_at = parse_message_timestamp(field("MSH", 7).split(component_sep)[0])
     return ParsedMessage(
         raw=normalized + "\r",
         sending_application=field("MSH", 3), sending_facility=field("MSH", 4),
         message_at=message_at, message_type=msg[0], trigger_event=msg[1],
         control_id=control_id, version=field("MSH", 12), patient=patient,
         encounter=encounter, observations=tuple(observations), orders=tuple(orders),
+        ordering_providers=tuple(providers),
     )
 

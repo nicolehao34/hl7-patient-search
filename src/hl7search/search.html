@@ -1,0 +1,188 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>HL7 search</title>
+  <style>
+    :root { color-scheme: light; font: 16px system-ui, sans-serif; color: #162b34; background: #f5f8f9; }
+    body { margin: 0; }
+    main { max-width: 68rem; margin: 0 auto; padding: 2rem 1rem; }
+    h1 { margin: .5rem 0 1.25rem; letter-spacing: -.04em; }
+    a { color: #075d65; }
+    .top { display: flex; gap: 1rem; justify-content: space-between; align-items: baseline; }
+    form, #result-panel { background: white; border: 1px solid #d7e2e7; border-radius: .65rem; padding: 1rem; }
+    fieldset { border: 0; padding: 0; margin: 0 0 1rem; }
+    fieldset[hidden] { display: none; }
+    legend { padding: 0; margin-bottom: .6rem; font-weight: 650; }
+    .fields { display: grid; gap: .7rem; grid-template-columns: repeat(auto-fit, minmax(10rem, 1fr)); }
+    label { display: grid; gap: .3rem; font-size: .875rem; }
+    input, select, button { box-sizing: border-box; font: inherit; color: inherit; border: 1px solid #8a9da6; border-radius: .35rem; padding: .48rem; }
+    input, select { width: 100%; min-width: 0; background: white; }
+    button { cursor: pointer; background: white; }
+    button[type="submit"] { background: #075d65; color: white; border-color: #075d65; padding-inline: 1.25rem; }
+    #mode { max-width: 14rem; margin-bottom: 1rem; }
+    #result-panel { margin-top: 1rem; }
+    #status { margin: 0 0 .65rem; }
+    .scroll { overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; text-align: left; font-size: .875rem; }
+    td, th { border-bottom: 1px solid #d7e2e7; padding: .55rem; }
+    td button { font-size: .8rem; padding: .25rem .5rem; }
+    pre { white-space: pre-wrap; overflow-wrap: anywhere; background: #f5f8f9; padding: .75rem; }
+  </style>
+</head>
+<body>
+<main>
+  <div class="top"><h1>HL7 search</h1><a href="/docs">API docs</a></div>
+  <label for="mode">Search for</label>
+  <select id="mode">
+    <option value="patients">Patients</option>
+    <option value="messages">HL7 messages</option>
+  </select>
+  <form id="search">
+    <fieldset id="patient-fields">
+      <legend>Admission filters</legend>
+      <div class="fields">
+        <label>Admitted on or after <input type="date" name="admitted_since"></label>
+        <label>Admitted before <input type="date" name="admitted_before"></label>
+        <label>Hospital <input name="facility" placeholder="GENERAL"></label>
+        <label>Visit status
+          <select name="status"><option value="">Any</option><option>active</option><option>discharged</option></select>
+        </label>
+        <label>Observation code <input name="observation_code" placeholder="2160-0"></label>
+      </div>
+    </fieldset>
+    <fieldset>
+      <legend>Source message filters</legend>
+      <div class="fields">
+        <label>Message type
+          <select name="message_type"><option value="">Any</option><option>ADT</option><option>ORU</option><option>ORM</option></select>
+        </label>
+        <label>Message date from (UTC) <input type="date" name="message_since"></label>
+        <label>Message date before (UTC) <input type="date" name="message_before"></label>
+        <label>Sending application <input name="sending_application" placeholder="DEMO_LIS"></label>
+        <label>Sending facility <input name="sending_facility" placeholder="GENERAL"></label>
+        <label>Ordering provider ID <input name="ordering_provider_id" placeholder="PROVIDER123"></label>
+      </div>
+    </fieldset>
+    <button type="submit">Search</button>
+  </form>
+  <section id="result-panel" aria-label="Search results">
+    <p id="status" role="status">Ready to search.</p>
+    <div class="scroll"><table id="results" hidden><thead></thead><tbody></tbody></table></div>
+    <button id="next" type="button" hidden>Next page</button>
+    <pre id="detail" hidden></pre>
+  </section>
+</main>
+<script>
+  const mode = document.querySelector('#mode');
+  const form = document.querySelector('#search');
+  const patientFields = document.querySelector('#patient-fields');
+  const status = document.querySelector('#status');
+  const table = document.querySelector('#results');
+  const detail = document.querySelector('#detail');
+  const next = document.querySelector('#next');
+  const weekAgo = new Date();
+  weekAgo.setUTCDate(weekAgo.getUTCDate() - 7);
+  form.elements.admitted_since.value = weekAgo.toISOString().slice(0, 10);
+  let activeSearch;
+  let detailRequest;
+  let nextParams;
+
+  async function getJSON(path, signal) {
+    const response = await fetch(path, { signal });
+    if (!response.ok) {
+      const body = await response.json();
+      throw new Error(typeof body.detail === 'string' ? body.detail : JSON.stringify(body.detail));
+    }
+    return response.json();
+  }
+
+  async function showDetail(endpoint, id) {
+    detailRequest?.abort();
+    detailRequest = new AbortController();
+    const { signal } = detailRequest;
+    detail.hidden = false;
+    detail.textContent = 'Loading…';
+    try {
+      const row = await getJSON('/' + endpoint + '/' + id, signal);
+      if (signal.aborted) return;
+      detail.textContent = row.raw ? row.raw.replaceAll('\r', '\n') : JSON.stringify(row, null, 2);
+      detail.scrollIntoView({ block: 'nearest' });
+    } catch (error) {
+      if (!signal.aborted) detail.textContent = error.message;
+    }
+  }
+
+  const columns = {
+    patients: [
+      ['Patient', row => [row.given_name, row.family_name].filter(Boolean).join(' ')],
+      ['MRN', row => row.external_id], ['Hospital', row => row.facility],
+      ['Admitted', row => row.admit_at], ['Status', row => row.status],
+    ],
+    messages: [
+      ['Type', row => row.message_type + '^' + row.trigger_event], ['Control ID', row => row.control_id],
+      ['Sent at (UTC)', row => row.message_at], ['Application', row => row.sending_application],
+      ['Facility', row => row.sending_facility],
+    ],
+  };
+
+  async function search(endpoint, params) {
+    activeSearch?.abort();
+    detailRequest?.abort();
+    activeSearch = new AbortController();
+    const { signal } = activeSearch;
+    status.textContent = 'Searching…';
+    table.hidden = detail.hidden = next.hidden = true;
+    try {
+      const rows = await getJSON('/' + endpoint + '?' + params, signal);
+      if (signal.aborted) return;
+      const fields = columns[endpoint];
+      table.tHead.replaceChildren();
+      table.tBodies[0].replaceChildren();
+      const head = table.tHead.insertRow();
+      for (const title of [...fields.map(([label]) => label), 'Details']) {
+        const th = document.createElement('th');
+        th.scope = 'col';
+        th.textContent = title;
+        head.append(th);
+      }
+      for (const row of rows) {
+        const tr = table.tBodies[0].insertRow();
+        for (const [, value] of fields) tr.insertCell().textContent = value(row) || '—';
+        const button = document.createElement('button');
+        button.textContent = endpoint === 'messages' ? 'View HL7' : 'View patient';
+        button.addEventListener('click', () => showDetail(endpoint, row.id));
+        tr.insertCell().append(button);
+      }
+      status.textContent = rows.length ? rows.length + ' result(s)' : 'No matches.';
+      table.hidden = !rows.length;
+      if (endpoint === 'messages' && rows.length === Number(params.get('limit'))) {
+        nextParams = new URLSearchParams(params);
+        nextParams.set('before_id', rows.at(-1).id);
+        next.hidden = false;
+      }
+    } catch (error) {
+      if (!signal.aborted) status.textContent = 'Search failed: ' + error.message;
+    }
+  }
+
+  form.addEventListener('submit', event => {
+    event.preventDefault();
+    const params = new URLSearchParams({ limit: '50' });
+    for (const [key, input] of new FormData(form)) {
+      const value = input.trim();
+      if (value) params.set(key, key.startsWith('message_') && key !== 'message_type'
+        ? value + 'T00:00:00Z' : key.startsWith('admitted_') ? value + 'T00:00:00' : value);
+    }
+    search(mode.value, params);
+  });
+  next.addEventListener('click', () => search('messages', nextParams));
+  mode.addEventListener('change', () => {
+    patientFields.hidden = patientFields.disabled = mode.value === 'messages';
+    form.requestSubmit();
+  });
+  form.requestSubmit();
+</script>
+</body>
+</html>

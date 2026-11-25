@@ -44,6 +44,12 @@ class Order:
 
 
 @dataclass(frozen=True, slots=True)
+class OrderingProvider:
+    identifier: str | None
+    name: str | None
+
+
+@dataclass(frozen=True, slots=True)
 class ParsedMessage:
     raw: str
     sending_application: str
@@ -57,4 +63,5 @@ class ParsedMessage:
     encounter: Encounter | None
     observations: tuple[Observation, ...] = field(default_factory=tuple)
     orders: tuple[Order, ...] = field(default_factory=tuple)
+    ordering_providers: tuple[OrderingProvider, ...] = field(default_factory=tuple)
 
