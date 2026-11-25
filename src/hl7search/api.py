@@ -23,6 +23,21 @@ class MessageFilters(BaseModel):
     message_type: str | None = None
     trigger_event: str | None = None
     control_id: str | None = None
+    event_code: str | None = None
+    event_reason: str | None = None
+    event_recorded_since: datetime | None = None
+    event_recorded_before: datetime | None = None
+    order_control: str | None = None
+    order_status: str | None = None
+    placer_order_id: str | None = None
+    filler_order_id: str | None = None
+    specimen_id: str | None = None
+    specimen_type: str | None = None
+    note_source: str | None = None
+    note_contains: str | None = Field(None, min_length=1)
+    diagnosis_code: str | None = None
+    diagnosis_system: str | None = None
+    diagnosis_type: str | None = None
     limit: int = Field(50, ge=1, le=500)
 
 

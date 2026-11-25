@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 import threading
 from collections.abc import Iterator
@@ -10,6 +11,35 @@ from typing import Any
 
 from .models import ParsedMessage
 from .parser import HL7ParseError, parse_message, utc_message_time
+
+SEGMENT_FILTERS = {
+    "EVN": {
+        "event_code": "json_extract(s.fields, '$.event_code') = ?",
+        "event_reason": "json_extract(s.fields, '$.event_reason') = ?",
+        "event_recorded_since": "json_extract(s.fields, '$.event_recorded_at') >= ?",
+        "event_recorded_before": "json_extract(s.fields, '$.event_recorded_at') < ?",
+    },
+    "ORC": {
+        "order_control": "json_extract(s.fields, '$.order_control') = ?",
+        "order_status": "json_extract(s.fields, '$.order_status') = ?",
+        "placer_order_id": "json_extract(s.fields, '$.placer_order_id') = ?",
+        "filler_order_id": "json_extract(s.fields, '$.filler_order_id') = ?",
+    },
+    "SPM": {
+        "specimen_type": "json_extract(s.fields, '$.specimen_type') = ?",
+        "specimen_id": "? IN (json_extract(s.fields, '$.placer_specimen_id'), "
+                       "json_extract(s.fields, '$.filler_specimen_id'))",
+    },
+    "NTE": {
+        "note_source": "json_extract(s.fields, '$.note_source') = ?",
+        "note_contains": "instr(lower(json_extract(s.fields, '$.note_text')), lower(?)) > 0",
+    },
+    "DG1": {
+        "diagnosis_code": "json_extract(s.fields, '$.diagnosis_code') = ?",
+        "diagnosis_system": "json_extract(s.fields, '$.diagnosis_system') = ?",
+        "diagnosis_type": "json_extract(s.fields, '$.diagnosis_type') = ?",
+    },
+}
 
 
 def message_predicates(filters: dict[str, Any]) -> tuple[list[str], list[Any]]:
@@ -41,6 +71,22 @@ def message_predicates(filters: dict[str, Any]) -> tuple[list[str], list[Any]]:
             values.append(filters[key])
     if len(provider) > 1:
         clauses.append(f"EXISTS (SELECT 1 FROM ordering_providers op WHERE {' AND '.join(provider)})")
+    for key in ("event_recorded_since", "event_recorded_before"):
+        if filters.get(key) is not None:
+            filters[key] = utc_message_time(filters[key]).isoformat()
+    event_since = filters.get("event_recorded_since")
+    event_before = filters.get("event_recorded_before")
+    if event_since is not None and event_before is not None and event_since >= event_before:
+        raise ValueError("event_recorded_since must be earlier than event_recorded_before")
+    for segment, conditions in SEGMENT_FILTERS.items():
+        selected = [key for key in conditions if filters.get(key) is not None]
+        if selected:
+            matches = " AND ".join(conditions[key] for key in selected)
+            clauses.append(
+                f"EXISTS (SELECT 1 FROM message_segments s "
+                f"WHERE s.message_id=m.id AND s.segment=? AND {matches})"
+            )
+            values.extend([segment, *(filters[key] for key in selected)])
     return clauses, values
 
 
@@ -112,25 +158,47 @@ class Store:
                 CREATE INDEX IF NOT EXISTS idx_message_patient ON messages(patient_id, id);
                 CREATE INDEX IF NOT EXISTS idx_observations_message_code ON observations(message_id, code);
                 CREATE INDEX IF NOT EXISTS idx_orders_message_code ON orders(message_id, code);
+                CREATE TABLE IF NOT EXISTS message_segments (
+                    message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+                    position INTEGER NOT NULL, segment TEXT NOT NULL, fields TEXT NOT NULL,
+                    PRIMARY KEY (message_id, position));
+                CREATE INDEX IF NOT EXISTS idx_message_segments_kind
+                    ON message_segments(message_id, segment);
             """)
             conn.execute("BEGIN IMMEDIATE")
-            if conn.execute("PRAGMA user_version").fetchone()[0] == 0:
+            version = conn.execute("PRAGMA user_version").fetchone()[0]
+            if version < 2:
                 for row in conn.execute("SELECT id, raw, message_at FROM messages"):
                     try:
                         message = parse_message(row["raw"])
                     except HL7ParseError:
                         continue
-                    timestamp = message.message_at.isoformat()
-                    if timestamp != row["message_at"]:
-                        conn.execute("UPDATE messages SET message_at=? WHERE id=?", (timestamp, row["id"]))
-                    self._insert_providers(conn, row["id"], message)
-                conn.execute("PRAGMA user_version=1")
+                    if version == 0:
+                        timestamp = message.message_at.isoformat()
+                        if timestamp != row["message_at"]:
+                            conn.execute(
+                                "UPDATE messages SET message_at=? WHERE id=?",
+                                (timestamp, row["id"]),
+                            )
+                        self._insert_providers(conn, row["id"], message)
+                    self._insert_search_segments(conn, row["id"], message)
+                conn.execute("PRAGMA user_version=2")
 
     @staticmethod
     def _insert_providers(conn: sqlite3.Connection, message_id: int, message: ParsedMessage) -> None:
         conn.executemany(
             "INSERT INTO ordering_providers (message_id, identifier, name) VALUES (?, ?, ?)",
             ((message_id, provider.identifier, provider.name) for provider in message.ordering_providers),
+        )
+
+    @staticmethod
+    def _insert_search_segments(
+        conn: sqlite3.Connection, message_id: int, message: ParsedMessage,
+    ) -> None:
+        conn.executemany(
+            "INSERT INTO message_segments (message_id, position, segment, fields) VALUES (?, ?, ?, ?)",
+            ((message_id, item.position, item.segment, json.dumps(item.fields))
+             for item in message.search_segments),
         )
 
     def ingest(self, message: ParsedMessage) -> int:
@@ -164,6 +232,7 @@ class Store:
                 raise DuplicateMessageError(message.control_id) from exc
             message_id = int(cursor.lastrowid)
             self._insert_providers(conn, message_id, message)
+            self._insert_search_segments(conn, message_id, message)
             if patient_id and message.encounter:
                 e = message.encounter
                 status = "discharged" if message.trigger_event == "A03" or e.discharge_at else "active"
@@ -271,7 +340,20 @@ class Store:
                 "SELECT identifier, name FROM ordering_providers WHERE message_id=? ORDER BY rowid",
                 (message_id,),
             )
-            return {**dict(row), "ordering_providers": [dict(provider) for provider in providers]}
+            segments = conn.execute(
+                "SELECT position, segment, fields FROM message_segments "
+                "WHERE message_id=? ORDER BY position",
+                (message_id,),
+            )
+            return {
+                **dict(row),
+                "ordering_providers": [dict(provider) for provider in providers],
+                "segments": [
+                    {"position": item["position"], "segment": item["segment"],
+                     "fields": json.loads(item["fields"])}
+                    for item in segments
+                ],
+            }
 
     def patient_detail(self, patient_id: int) -> dict[str, Any] | None:
         with self.connect() as conn:

@@ -121,7 +121,7 @@ Indexing the headers and providers lets history searches run without reparsing p
 | `GET /patients` | Searches patient and encounter records by `facility`, `admitted_since`, `admitted_before`, `status`, `patient_class`, `mrn`, `observation_code`, `observation_min`, `observation_max`, and `order_code`, plus the message filters below. Numeric bounds require an observation code. |
 | `GET /patients/{id}` | Returns demographics, encounters, observations, and orders for an internal patient ID. Returns `404` if the record is missing. |
 | `GET /messages` | Lists metadata. Filter by internal `patient_id` for patient history. Pass the last item's `id` as `before_id` to fetch the next page with the same filters. |
-| `GET /messages/{id}` | Returns metadata, ordering providers, and the stored HL7 payload in `raw`. Returns `404` if the record is missing. |
+| `GET /messages/{id}` | Returns metadata, ordering providers, extracted `segments`, and the stored HL7 payload in `raw`. Returns `404` if the record is missing. |
 | `GET /health` | Reports service status and SQLite row counts. |
 
 Both search endpoints default to `limit=50`, with a maximum of 500. Admission and message time
@@ -136,6 +136,18 @@ Both search endpoints accept these filters:
 | `message_since`, `message_before` | Inclusive start and exclusive end on `MSH-7`. Use ISO 8601 query values. Offsets are converted to UTC and omitted offsets are treated as UTC for the demo. The response's `message_at` uses UTC with no suffix. |
 | `ordering_provider_id`, `ordering_provider_name` | Search every `OBR-16` repetition, including on ORU results. Match `XCN.1` exactly or the extracted `Given Surname` using SQLite's ASCII case-insensitive comparison. When both filters are set, they must match the same provider repetition. |
 | `message_type`, `trigger_event`, `control_id` | Exact match on `MSH-9.1`, `MSH-9.2`, and `MSH-10`. |
+| `event_code`, `event_reason`, `event_recorded_since`, `event_recorded_before` | `EVN-1`, `EVN-4`, and a half-open window on `EVN-2`. |
+| `order_control`, `order_status`, `placer_order_id`, `filler_order_id` | `ORC-1`, `ORC-5`, and the identifier components of `ORC-2/3`. |
+| `specimen_id`, `specimen_type` | Either identifier in `SPM-2` and the primary type code in `SPM-4`. |
+| `note_source`, `note_contains` | Exact match on `NTE-2` and a literal substring match on decoded `NTE-3`, case-insensitive for ASCII. |
+| `diagnosis_code`, `diagnosis_system`, `diagnosis_type` | Primary code and coding system in `DG1-3`, and type in `DG1-6`. |
+
+Filters on the same segment type must match one occurrence of that segment. Filters on different
+segment types must match one source message. The message detail response lists each extracted
+occurrence in source order, with its segment name, position, and fields. It also includes fields
+without dedicated filters, such as event occurrence time, order transaction time, specimen
+collection interval and receipt time, note type, and diagnosis time. The new timestamp fields
+use the same UTC convention as `message_at`. Malformed optional timestamps remain in the HL7 text.
 
 ```bash
 # Two lab messages from GENERAL in a freshly seeded database
@@ -143,15 +155,19 @@ curl 'http://127.0.0.1:8000/messages?message_type=ORU&sending_application=DEMO_L
 
 # Avery and Casey have creatinine of at least 1.5 mg/dL in the seeded feed
 curl 'http://127.0.0.1:8000/patients?ordering_provider_id=PROVIDER123&observation_code=2160-0&observation_min=1.5'
+
+# The new CT order in the seeded feed
+curl 'http://127.0.0.1:8000/messages?order_control=NW&placer_order_id=DEMO-CT-1'
 ```
 
 To restrict message history to an interval, add `message_since=2026-11-25T00:00:00Z` and
 `message_before=2026-11-26T00:00:00Z` (or use dates from your seed run). These filter the sender's
 message time. Use `admitted_since` and `admitted_before` for a patient's admission time.
 
-On first startup with an older SQLite database, the service backfills ordering providers and
-normalized message times from retained HL7 in a write transaction. Allow extra startup time for
-large databases. Legacy records that fail the current parser retain their existing metadata.
+On first startup with an older SQLite database, the service backfills the new segment records
+from retained HL7 in a write transaction. Databases from before the provider-search update also
+get ordering providers and normalized message times. Allow extra startup time for large databases.
+Legacy records that fail the current parser retain their existing metadata.
 
 ## The ten seeded HL7 messages
 

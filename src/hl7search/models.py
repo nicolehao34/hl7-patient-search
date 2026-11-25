@@ -50,6 +50,13 @@ class OrderingProvider:
 
 
 @dataclass(frozen=True, slots=True)
+class SearchSegment:
+    segment: str
+    position: int
+    fields: dict[str, str]
+
+
+@dataclass(frozen=True, slots=True)
 class ParsedMessage:
     raw: str
     sending_application: str
@@ -64,4 +71,5 @@ class ParsedMessage:
     observations: tuple[Observation, ...] = field(default_factory=tuple)
     orders: tuple[Order, ...] = field(default_factory=tuple)
     ordering_providers: tuple[OrderingProvider, ...] = field(default_factory=tuple)
+    search_segments: tuple[SearchSegment, ...] = field(default_factory=tuple)
 

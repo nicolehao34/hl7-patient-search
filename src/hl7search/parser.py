@@ -3,7 +3,15 @@ from __future__ import annotations
 import re
 from datetime import UTC, datetime
 
-from .models import Encounter, Observation, Order, OrderingProvider, ParsedMessage, Patient
+from .models import (
+    Encounter,
+    Observation,
+    Order,
+    OrderingProvider,
+    ParsedMessage,
+    Patient,
+    SearchSegment,
+)
 
 
 class HL7ParseError(ValueError):
@@ -62,6 +70,64 @@ def _unescape(value: str | None, escape: str = "\\") -> str | None:
     return value
 
 
+def _extract_search_segments(
+    rows: list[list[str]], component: str, repetition: str, subcomponent: str, escape: str,
+) -> tuple[SearchSegment, ...]:
+    fields_by_segment = {
+        "EVN": {"event_code": (1, None), "event_reason": (4, None), "event_facility": (7, 0)},
+        "ORC": {"order_control": (1, None), "placer_order_id": (2, 0),
+                "filler_order_id": (3, 0), "order_status": (5, None)},
+        "SPM": {"specimen_type": (4, 0), "specimen_display": (4, 1),
+                "specimen_system": (4, 2)},
+        "NTE": {"note_source": (2, None), "note_type": (4, 0)},
+        "DG1": {"diagnosis_code": (3, 0), "diagnosis_display": (3, 1),
+                "diagnosis_system": (3, 2), "diagnosis_type": (6, None)},
+    }
+    times_by_segment = {
+        "EVN": {"event_recorded_at": (2, 0), "event_occurred_at": (6, 0)},
+        "ORC": {"order_transaction_at": (9, 0)},
+        "SPM": {"specimen_collected_at": (17, 0), "specimen_collection_end": (17, 1),
+                "specimen_received_at": (18, 0)},
+        "DG1": {"diagnosis_at": (5, 0)},
+    }
+    def value(row: list[str], number: int, index: int | None = None) -> str:
+        raw = row[number] if number < len(row) else ""
+        return raw if index is None else _component(raw, index, component) or ""
+
+    results: list[SearchSegment] = []
+    for position, row in enumerate(rows, start=1):
+        segment = row[0]
+        if segment not in fields_by_segment:
+            continue
+
+        data: dict[str, str] = {}
+        for key, (number, index) in fields_by_segment[segment].items():
+            if decoded := _unescape(value(row, number, index), escape):
+                data[key] = decoded
+        for key, (number, index) in times_by_segment.get(segment, {}).items():
+            raw_time = value(row, number, index)
+            if raw_time:
+                try:
+                    data[key] = parse_message_timestamp(raw_time).isoformat()
+                except HL7ParseError:
+                    # Optional malformed fields remain available in the source payload.
+                    continue
+        if segment == "SPM":
+            for index, key in enumerate(("placer_specimen_id", "filler_specimen_id")):
+                identifier = value(row, 2, index).split(subcomponent)[0]
+                if decoded := _unescape(identifier, escape):
+                    data[key] = decoded
+        if segment == "NTE" and value(row, 3):
+            data["note_text"] = "\n".join(
+                _unescape(part, escape) or "" for part in value(row, 3).split(repetition)
+            )
+        if (segment == "DG1" and "diagnosis_display" not in data
+                and (decoded := _unescape(value(row, 4), escape))):
+            data["diagnosis_display"] = decoded
+        results.append(SearchSegment(segment, position, data))
+    return tuple(results)
+
+
 def parse_message(raw: str | bytes) -> ParsedMessage:
     if isinstance(raw, bytes):
         try:
@@ -85,8 +151,8 @@ def parse_message(raw: str | bytes) -> ParsedMessage:
     escape = encoding[2] if len(encoding) > 2 else "\\"
     subcomponent_sep = encoding[3] if len(encoding) > 3 else "&"
     segments: dict[str, list[list[str]]] = {}
-    for line in lines:
-        fields = line.split(field_sep)
+    rows = [line.split(field_sep) for line in lines]
+    for fields in rows:
         segments.setdefault(fields[0], []).append(fields)
 
     def field(segment: str, number: int, repetition: int = 0) -> str:
@@ -182,5 +248,8 @@ def parse_message(raw: str | bytes) -> ParsedMessage:
         control_id=control_id, version=field("MSH", 12), patient=patient,
         encounter=encounter, observations=tuple(observations), orders=tuple(orders),
         ordering_providers=tuple(providers),
+        search_segments=_extract_search_segments(
+            rows, component_sep, repetition_sep, subcomponent_sep, escape,
+        ),
     )
 
